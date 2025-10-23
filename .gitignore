@@ -1,0 +1,8 @@
+node_modules/
+last_mercari.html
+*.log
+.DS_Store
+.env
+playwright-report/
+blob-report/
+test-results/

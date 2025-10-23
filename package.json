@@ -1,0 +1,19 @@
+{
+  "name": "mercari-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build": "npx playwright install --with-deps",
+    "dev": "PORT=10000 node index.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.56.1"
+  }
+}
