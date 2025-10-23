@@ -1,6 +1,8 @@
 // ================================
 // mercari-scraper 完全版（Render / GPT Actions 対応）
 // Playwright ステルス対応 + HTML保存 + DOM解析強化
+// 追加: 価格数値化・通貨/JPY, ブランド推定, 状態フォールバック,
+//       chromium.executablePath() 明示, GET /scrape の 405
 // ================================
 
 import express from "express";
@@ -18,11 +20,16 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors());
 
-// -------------------------------
-// 🔐 簡易API鍵（任意）
-//   - 環境変数 API_KEY を設定した場合のみ有効
-//   - リクエストヘッダ x-api-key と照合
-// -------------------------------
+// ---- Utils ----
+const clean = (v) =>
+  (v || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+const toYenNumber = (s) => {
+  if (!s) return null;
+  const num = String(s).replace(/[^\d]/g, "");
+  return num ? Number(num) : null;
+};
+
+// ---- API Key (optional) ----
 const API_KEY = process.env.API_KEY || "";
 app.use((req, res, next) => {
   if (!API_KEY) return next();
@@ -33,20 +40,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// --------------------------------
-// ✅ Health check
-// --------------------------------
-app.get("/health", (_, res) =>
-  res.json({ ok: true, ts: new Date().toISOString() })
-);
+// ---- Health ----
+app.get("/health", (_, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 
-// --------------------------------
-// ✅ Probe（HTMLサイズテスト）
-// --------------------------------
+// ---- Probe (HTML size) ----
 app.get("/probe", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing URL" });
-
   try {
     const html = await fetch(url).then((r) => r.text());
     res.json({ ok: true, url, textLen: html.length });
@@ -55,19 +55,15 @@ app.get("/probe", async (req, res) => {
   }
 });
 
-// --------------------------------
-// ✅ /scrape（メルカリ or メーカー単体スクレイプ）
-// --------------------------------
+// ---- Scrape (mercari / maker) ----
 app.post("/scrape", async (req, res) => {
   const { url, type } = req.body || {};
   if (!url) return res.status(400).json({ ok: false, error: "URL required" });
 
+  let browser;
   try {
-    // --------------------------------
-    // 🧠 Playwright 起動（Render本番はヘッドレス推奨）
-    //   - HEADLESS=0 を付与するとローカルで可視ブラウザ起動
-    // --------------------------------
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
+      executablePath: chromium.executablePath(), // ← 同梱/キャッシュ両対応
       headless: process.env.HEADLESS !== "0",
       args: [
         "--disable-blink-features=AutomationControlled",
@@ -87,128 +83,121 @@ app.post("/scrape", async (req, res) => {
       },
     });
 
-    const page = await context.newPage();
-
-    // ✅ ステルス対策: webdriver検知を回避
-    await page.addInitScript(() => {
+    await context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    // --------------------------------
-    // 🔄 ページ読み込み + HTML保存（デバッグ用）
-    // --------------------------------
+    const page = await context.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90000 });
 
     try {
-      await page.waitForSelector("h1, [data-testid='item-name']", {
-        timeout: 15000,
-      });
+      await page.waitForSelector("h1, [data-testid='item-name']", { timeout: 15000 });
       await page.waitForTimeout(1500);
-    } catch {
-      // ページ構造変化などで描画が遅い場合もあるので続行
-    }
+    } catch {}
 
-    // HTMLダンプ（Renderの一時FSにも保存可。不要なら削除OK）
     try {
       const htmlDump = await page.content();
       fs.writeFileSync(path.join(__dirname, "last_mercari.html"), htmlDump);
-    } catch {
-      // 書き込み失敗は無視
-    }
+    } catch {}
 
-    // --------------------------------
-    // 🔍 抽出
-    // --------------------------------
     const data = {};
 
     if (type === "mercari") {
       // タイトル
-      data.title =
+      data.title = clean(
         (await page.locator("h1").first().textContent().catch(() => "")) ||
-        (await page
-          .locator("div[data-testid='item-name']")
-          .first()
-          .textContent()
-          .catch(() => "")) ||
-        "";
+        (await page.locator("div[data-testid='item-name']").first().textContent().catch(() => "")) ||
+        ""
+      );
 
-      // 価格（厳しめセレクタ + 正規表現でクリーン）
+      // 価格
       const priceText =
-        (await page
-          .locator(
-            [
-              '[data-testid="item-price"]',
-              '[class*="Price"]',
-              "text=/¥\\s*[0-9,.]+/",
-            ].join(", ")
-          )
-          .first()
-          .textContent()
-          .catch(() => "")) ||
-        (await page
-          .locator("text=/¥\\s*[0-9,.]+/")
-          .first()
-          .textContent()
-          .catch(() => ""));
+        (await page.locator(
+          [
+            '[data-testid="item-price"]',
+            '[class*="Price"]',
+            "text=/¥\\s*[0-9,.]+/",
+          ].join(", ")
+        ).first().textContent().catch(() => "")) ||
+        (await page.locator("text=/¥\\s*[0-9,.]+/").first().textContent().catch(() => ""));
 
       const m = (priceText || "").match(/¥\s*[\d,.]+/);
-      data.price = m ? m[0].replace(/\s+/g, "") : "";
+      data.price = m ? clean(m[0]) : "";
+      data.priceNumber = toYenNumber(data.price);
+      data.currency = data.price ? "JPY" : undefined;
 
       // ブランド
-      data.brand =
+      data.brand = clean(
         (await page
           .locator("dt:has-text('ブランド') + dd, a[href*='/brand/']")
           .first()
           .textContent()
-          .catch(() => "")) || "";
+          .catch(() => "")) || ""
+      );
+      // 空ならタイトルから推定
+      if (!data.brand && data.title) {
+        const t = data.title.toLowerCase();
+        if (t.includes("kinujo") || t.includes("絹女") || t.includes("キヌージョ")) {
+          data.brand = "KINUJO";
+        }
+      }
 
       // コンディション
-      data.condition =
-        (await page
-          .locator("dt:has-text('商品の状態') + dd")
+      data.condition = clean(
+        (await page.locator("dt:has-text('商品の状態') + dd").first().textContent().catch(() => "")) || ""
+      );
+      if (!data.condition) {
+        const raw = await page
+          .locator(
+            [
+              "dt:has-text('状態') + dd",
+              "[data-testid*='condition']",
+              "[class*='Condition']",
+              "text=/未使用に近い|新品|やや傷や汚れあり|傷や汚れあり|全体的に状態が悪い/",
+            ].join(", ")
+          )
           .first()
           .textContent()
-          .catch(() => "")) || "";
+          .catch(() => "");
+        data.condition = clean(raw);
+      }
 
       // 商品説明
-      data.description =
-        (await page
-          .locator('[data-testid="item-description"]')
-          .first()
-          .textContent()
-          .catch(() => "")) ||
+      data.description = clean(
+        (await page.locator('[data-testid="item-description"]').first().textContent().catch(() => "")) ||
         (await page.locator("section:has(p)").first().textContent().catch(() => "")) ||
-        "";
+        ""
+      );
     } else {
-      // 🏭 メーカー公式ページ（汎用）
+      // メーカー汎用
       const html = await page.content();
-      data.title = await page.title();
+      data.title = clean(await page.title());
       data.htmlLen = html.length;
       try {
-        const meta = await page
-          .locator("meta[name='description']")
-          .first()
-          .getAttribute("content");
-        if (meta) data.description = meta;
+        const meta = await page.locator("meta[name='description']").first().getAttribute("content");
+        if (meta) data.description = clean(meta);
       } catch {}
+      data.specs = data.specs || [];
+      data.features = data.features || [];
     }
 
-    await browser.close();
     res.json({ ok: true, url, type, data });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
 });
 
-// --------------------------------
-// ✅ /scrapeBoth（メルカリ＋メーカー統合）
-// --------------------------------
+// GET /scrape → 405（完全版のサイン）
+app.get("/scrape", (_, res) => {
+  res.status(405).json({ ok: false, error: "Method Not Allowed. Use POST /scrape" });
+});
+
+// ---- /scrapeBoth ----
 app.post("/scrapeBoth", async (req, res) => {
   const { mercariUrl, makerUrl } = req.body || {};
-  if (!mercariUrl && !makerUrl)
-    return res
-      .status(400)
-      .json({ ok: false, error: "mercariUrl または makerUrl は必須です" });
+  if (!mercariUrl && !makerUrl) {
+    return res.status(400).json({ ok: false, error: "mercariUrl または makerUrl は必須です" });
+  }
 
   const base = process.env.INTERNAL_BASE || "http://127.0.0.1:10000";
   const headers = {
@@ -236,6 +225,8 @@ app.post("/scrapeBoth", async (req, res) => {
       brand: m.brand || "",
       productName: m.title || k.title || "",
       price: m.price || "",
+      priceNumber: m.priceNumber ?? toYenNumber(m.price),
+      currency: m.currency || (m.price ? "JPY" : undefined),
       condition: m.condition || "",
       description_user: m.description || "",
       specs_official: k.specs || [],
@@ -248,8 +239,6 @@ app.post("/scrapeBoth", async (req, res) => {
   }
 });
 
-// --------------------------------
-// ✅ サーバー起動（Render は 0.0.0.0 で listen 推奨）
-// --------------------------------
+// ---- Server ----
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log(`✅ Server running on ${PORT}`));
