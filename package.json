@@ -7,9 +7,12 @@
   "scripts": {
     "start": "node index.js",
     "build": "npx playwright install --with-deps",
-    "dev": "PORT=10000 node index.js"
+    "dev": "PORT=10000 node index.js",
+    "postinstall": "npx playwright install chromium"
   },
-  "engines": { "node": "20.x" },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.21.2",
