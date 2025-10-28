@@ -259,7 +259,7 @@ async function getBrowser() {
   return browserPromise;
 }
 
-aasync function scrapeWithPlaywright(url) {
+async function scrapeWithPlaywright(url) {
   const browser = await withTimeout(getBrowser(), 45_000, 'browserType.launch: Timeout');
   const context = await browser.newContext({
     locale: 'ja-JP',
