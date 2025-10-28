@@ -12,6 +12,7 @@ const DIRECT_FIRST = process.env.DIRECT_FIRST !== '0';
 const DIRECT_ONLY_ENV = process.env.DIRECT_ONLY === '1';
 const FETCH_TIMEOUT_MS = process.env.FETCH_TIMEOUT_MS ? Number(process.env.FETCH_TIMEOUT_MS) : 7000;
 const NAV_TIMEOUT_MS = process.env.NAV_TIMEOUT_MS ? Number(process.env.NAV_TIMEOUT_MS) : 25000;
+const SCAN_LIMIT_BYTES = process.env.SCAN_LIMIT_BYTES ? Number(process.env.SCAN_LIMIT_BYTES) : 900000; // ★増量
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -37,7 +38,7 @@ function withTimeout(promise, ms, message = 'Timeout') {
   });
 }
 
-/* ---------- 直取り（JSON-LD + meta + 全文パターン） ---------- */
+/* ---------- 直取り（既存ヘルパ） ---------- */
 function pickMeta(content, name) {
   const m = new RegExp(`<meta[^>]+${name}=["'][^"']*["'][^>]*content=["']([^"']+)["'][^>]*>`, 'i').exec(content);
   return m ? m[1].trim() : '';
@@ -51,7 +52,7 @@ function pickPriceFromText(txt) {
   return m ? { priceText: `¥ ${m[1]}`, priceNumber: Number(m[1].replace(/,/g,'')) } : null;
 }
 
-/* ===== ヘルパ（精度UP用：メタ順不同・タイトル/価格強化・JSONスキャン） ===== */
+/* ===== 直取り・精度UP用ヘルパ ===== */
 function pickMetaContent(html, attr, value) {
   const re1 = new RegExp(`<meta[^>]*${attr}=["']${value}["'][^>]*content=["']([^"']+)["'][^>]*>`, 'i');
   const re2 = new RegExp(`<meta[^>]*content=["']([^"']+)["'][^>]*${attr}=["']${value}["'][^>]*>`, 'i');
@@ -80,6 +81,15 @@ function pickAllYen(html) {
   }
   return out;
 }
+// 上位の中央値（送料¥300等を弾きやすい）
+function choosePrice(nums) {
+  const filtered = nums.filter(n => n >= 1000 && n <= 10_000_000).sort((a,b)=>b-a);
+  if (!filtered.length) return null;
+  const top = filtered.slice(0, 5);
+  top.sort((a,b)=>a-b);
+  const mid = top[Math.floor(top.length/2)];
+  return { priceText: `¥ ${mid.toLocaleString('ja-JP')}`, priceNumber: mid };
+}
 function extractBetweenLabels(html, startLabel, endLabel) {
   const s = html.indexOf(startLabel);
   if (s < 0) return '';
@@ -95,10 +105,13 @@ function jsonBlocksFromScripts(html) {
   while ((m = reScript.exec(html))) {
     let txt = m[1].trim();
     if (!txt) continue;
-    const brace = txt.indexOf('{');
-    if (brace >= 0) {
-      const cand = txt.slice(brace);
-      try { out.push(JSON.parse(cand)); } catch {}
+    if (txt.startsWith('{') || txt.startsWith('[')) {
+      try { out.push(JSON.parse(txt)); continue; } catch {}
+    }
+    // 先頭以外に JSON が埋まっている場合の簡易抽出
+    const idx = txt.indexOf('{"');
+    if (idx >= 0) {
+      try { out.push(JSON.parse(txt.slice(idx))); } catch {}
     }
   }
   return out;
@@ -151,9 +164,9 @@ async function directFetchMercari(url) {
       },
     });
     const html = await res.text();
-    const headOnly = html.slice(0, 120000);
+    const headOnly = html.slice(0, SCAN_LIMIT_BYTES); // ★先頭を広く見る
 
-    // 1) __NEXT_DATA__ などの JSON を総なめ
+    // 1) __NEXT_DATA__ 等の JSON を総なめ
     const jsonObjs = jsonBlocksFromScripts(headOnly);
     const cand = bestProductCandidate(jsonObjs);
 
@@ -180,12 +193,12 @@ async function directFetchMercari(url) {
       } catch {}
     }
 
-    // 3) タイトル候補
-    const ogTitle = pickMetaContent(headOnly, 'property', 'og:title');
+    // 3) タイトル候補（順不同のmetaにも対応、Twitterカードも見る）
+    const ogTitle = pickMetaContent(headOnly, 'property', 'og:title') || pickMetaContent(headOnly, 'name', 'og:title') || pickMetaContent(headOnly, 'name', 'twitter:title');
     const titleTag = pickTagText(headOnly, 'title');
     const h1 = pickH1(headOnly);
 
-    // 4) 価格（JSON → JSON-LD → meta → 本文の最大¥）
+    // 4) 価格決定：JSON → JSON-LD → meta → 本文の“上位中央値”
     const priceFromJson = cand?.priceNum ? { priceText: `¥ ${cand.priceNum.toLocaleString('ja-JP')}`, priceNumber: cand.priceNum } : null;
     const priceFromLd   = product?.offers?.price ? { priceText: `¥ ${Number(product.offers.price).toLocaleString('ja-JP')}`, priceNumber: Number(product.offers.price) } : null;
     const metaPriceRaw  = pickMetaAnyOrder(headOnly, [
@@ -199,9 +212,9 @@ async function directFetchMercari(url) {
       return (!Number.isNaN(n) && n>0) ? { priceText: `¥ ${n.toLocaleString('ja-JP')}`, priceNumber: n } : null;
     })() : null;
 
-    const nums = pickAllYen(headOnly);
-    const bodyMax = nums.length ? Math.max(...nums) : null;
-    const priceFromBody = bodyMax ? { priceText: `¥ ${bodyMax.toLocaleString('ja-JP')}`, priceNumber: bodyMax } : null;
+    // 本文は広く見る（送料¥300などを弾きやすくする）
+    const nums = pickAllYen(html.slice(0, SCAN_LIMIT_BYTES));
+    const priceFromBody = choosePrice(nums);
 
     const price = priceFromJson || priceFromLd || priceFromMeta || priceFromBody;
 
@@ -222,7 +235,7 @@ async function directFetchMercari(url) {
           currency: 'JPY',
           description
         },
-        raw: { source: cand ? 'json' : (product ? 'ld+json' : (priceFromMeta ? 'meta' : 'body-max')) }
+        raw: { source: cand ? 'json' : (product ? 'ld+json' : (priceFromMeta ? 'meta' : 'body-median')) }
       };
     }
     return { ok: false, reason: 'direct_incomplete' };
@@ -270,7 +283,7 @@ async function scrapeWithPlaywright(url) {
   await page.waitForFunction(() => /¥\s*[0-9,.]+/.test(document.body?.innerText || ''), { timeout: 5000 }).catch(() => {});
   const domData = await page.evaluate(() => {
     const get = sel => document.querySelector(sel)?.textContent?.trim() || '';
-    const meta = p => document.querySelector(`meta[property="${p}"]`)?.content || '';
+    const meta = p => document.querySelector(`meta[property="\${p}"]`)?.content || '';
     const title = get('h1, h1[aria-label], [data-testid="item-title"], [class*="ItemHeader_title"]') || meta('og:title') || document.title || '';
     const body = (document.body?.innerText || '').replace(/\s+/g,' ');
     const m = body.match(/¥\s*[0-9,.]+/);
@@ -315,7 +328,7 @@ async function scrapeWithPlaywright(url) {
   await writeDebugHTML(html, 'mercari');
   await context.close();
 
-  if (!title && !priceText) return { ok: false, reason: 'playwright_incomplete' };
+  if (!title && !priceText) return { ok: false, reason: 'playwright_incomplete' });
   return { ok: true, via: 'playwright', data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description: '' } };
 }
 
@@ -352,4 +365,4 @@ async function shutdown() { try { const b = await browserPromise; await b?.close
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-app.listen(PORT, () => { console.log(`[mercari-scraper] listening on :${PORT} HEADLESS=${HEADLESS} DIRECT_FIRST=${DIRECT_FIRST}`); });
+app.listen(PORT, () => { console.log(`[mercari-scraper] listening on :\${PORT} HEADLESS=\${HEADLESS} DIRECT_FIRST=\${DIRECT_FIRST}`); });
