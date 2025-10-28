@@ -5,26 +5,22 @@ import express from 'express';
 import { chromium } from 'playwright';
 import fs from 'fs/promises';
 
-// ---------- 環境変数 ----------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
 const API_KEY = process.env.API_KEY || '';
 const HEADLESS = process.env.HEADLESS !== '0';
-const DIRECT_FIRST = process.env.DIRECT_FIRST !== '0'; // true: HTTP直取りを先に試す
+const DIRECT_FIRST = process.env.DIRECT_FIRST !== '0';
+const DIRECT_ONLY = process.env.DIRECT_ONLY === '1';
 const FETCH_TIMEOUT_MS = process.env.FETCH_TIMEOUT_MS ? Number(process.env.FETCH_TIMEOUT_MS) : 8000;
 const NAV_TIMEOUT_MS = process.env.NAV_TIMEOUT_MS ? Number(process.env.NAV_TIMEOUT_MS) : 180000;
 
-// ---------- サーバ初期化 ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-
-// CORS（任意）
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   next();
 });
 
-// API Key 認証ミドルウェア
 function requireApiKey(req, res, next) {
   if (!API_KEY) return res.status(500).json({ ok: false, error: 'Server missing API_KEY' });
   const key = req.headers['x-api-key'];
@@ -32,15 +28,8 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ---------- ユーティリティ ----------
 function nowISO() { return new Date().toISOString(); }
-
-async function writeDebugHTML(html, tag = 'mercari') {
-  try {
-    await fs.writeFile(`/tmp/last_${tag}.html`, html ?? '', 'utf8');
-  } catch (_) {}
-}
-
+async function writeDebugHTML(html, tag = 'mercari') { try { await fs.writeFile(`/tmp/last_${tag}.html`, html ?? '', 'utf8'); } catch {} }
 function withTimeout(promise, ms, message = 'Timeout') {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${message} ${ms}ms exceeded`)), ms);
@@ -48,7 +37,6 @@ function withTimeout(promise, ms, message = 'Timeout') {
   });
 }
 
-// ---------- 1) HTTP直取り（JSON-LD優先） ----------
 async function directFetchMercari(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -62,7 +50,6 @@ async function directFetchMercari(url) {
       },
     });
     const html = await res.text();
-    // JSON-LD を抽出
     const ldBlocks = Array.from(html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)).map(m => m[1]);
     let product = null;
     for (const block of ldBlocks) {
@@ -70,25 +57,29 @@ async function directFetchMercari(url) {
         const json = JSON.parse(block.trim());
         const items = Array.isArray(json) ? json : [json];
         for (const it of items) {
-          if (it && (it['@type'] === 'Product' || (Array.isArray(it['@type']) && it['@type'].includes('Product')))) {
-            product = it; break;
+          const graph = Array.isArray(it?.['@graph']) ? it['@graph'] : [it];
+          for (const g of graph) {
+            if (!g) continue;
+            const t = g['@type'];
+            if (t === 'Product' || (Array.isArray(t) && t.includes('Product'))) { product = g; break; }
           }
+          if (!product) {
+            const t = it['@type'];
+            if (t === 'Product' || (Array.isArray(t) && t.includes('Product'))) { product = it; }
+          }
+          if (product) break;
         }
         if (product) break;
-      } catch (_) { /* JSON.parse 失敗は無視 */ }
+      } catch {}
     }
-
-    // JSON-LDから整形
     if (product) {
       const title = product.name || product.title || '';
       const brand = typeof product.brand === 'string' ? product.brand : (product.brand?.name || '');
       const offers = Array.isArray(product.offers) ? product.offers[0] : product.offers;
       const priceNumber = offers?.price ? Number(String(offers.price).replace(/[^0-9.]/g, '')) : undefined;
       const currency = offers?.priceCurrency || 'JPY';
-      // ページ上の¥をフォールバック抽出
       const priceMatch = html.match(/¥\s*([0-9,]+)/);
-      const priceText = priceMatch ? `¥${priceMatch[1]}` : (offers?.price ? `¥${Number(offers.price).toLocaleString('ja-JP')}` : '');
-
+      const priceText = priceMatch ? `¥${priceMatch[1]}` : (priceNumber ? `¥${priceNumber.toLocaleString('ja-JP')}` : '');
       if (title && (priceText || priceNumber)) {
         return {
           ok: true,
@@ -105,24 +96,13 @@ async function directFetchMercari(url) {
         };
       }
     }
-
-    // タイトル/価格が見つからなければ失敗扱い（Playwrightへフォールバック）
     return { ok: false, reason: 'direct_incomplete' };
-  } finally {
-    clearTimeout(id);
-  }
+  } finally { clearTimeout(id); }
 }
 
-// ---------- 2) Playwright（シングルトン起動＋軽量化） ----------
 let browserPromise = null;
 async function getBrowser() {
-  if (browserPromise) {
-    try {
-      const b = await browserPromise;
-      // playwright v1.48+ doesn't have isConnected on Browser; if not present, assume alive
-      if (!('isConnected' in b) || b.isConnected()) return b;
-    } catch (_) { /* fallthrough to re-launch */ }
-  }
+  if (browserPromise) { try { const b = await browserPromise; if (!('isConnected' in b) || b.isConnected()) return b; } catch {} }
   browserPromise = chromium.launch({
     headless: HEADLESS,
     args: [
@@ -148,110 +128,71 @@ async function scrapeWithPlaywright(url) {
     timezoneId: 'Asia/Tokyo',
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   });
-
-  // 重いリソース遮断
   await context.route('**/*', route => {
     const t = route.request().resourceType();
     if (['image', 'font', 'media'].includes(t)) return route.abort();
     route.continue();
   });
-
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }); }
+  catch { await page.goto(url, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS }); }
 
-  // ナビゲーション（フォールバック1回）
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-  } catch (_) {
-    await page.goto(url, { waitUntil: 'load', timeout: NAV_TIMEOUT_MS });
-  }
-
-  // まず JSON-LD を読む
-  const ld = await page.$$eval('script[type="application/ld+json"]', nodes => nodes.map(n => n.textContent || ''));
+  const ld = await page.$$eval('script[type="application/ld+json"]', ns => ns.map(n => n.textContent || ''));
   let fromLd = null;
   for (const block of ld) {
     try {
       const json = JSON.parse(block.trim());
-      const items = Array.isArray(json) ? json : [json];
-      for (const it of items) {
-        if (it && (it['@type'] === 'Product' || (Array.isArray(it['@type']) && it['@type'].includes('Product')))) {
-          fromLd = it; break;
+      const list = Array.isArray(json) ? json : [json];
+      for (const it of list) {
+        const graph = Array.isArray(it?.['@graph']) ? it['@graph'] : [it];
+        for (const g of graph) {
+          if (!g) continue;
+          const t = g['@type'];
+          if (t === 'Product' || (Array.isArray(t) && t.includes('Product'))) { fromLd = g; break; }
         }
+        if (!fromLd) {
+          const t = it['@type'];
+          if (t === 'Product' || (Array.isArray(t) && t.includes('Product'))) { fromLd = it; }
+        }
+        if (fromLd) break;
       }
       if (fromLd) break;
-    } catch (_) {}
+    } catch {}
   }
 
-  // DOMからもフォールバック抽出（セレクタは汎用）
+  await page.waitForFunction(() => /¥\s*[0-9,.]+/.test(document.body?.innerText || ''), { timeout: 5000 }).catch(() => {});
   const domData = await page.evaluate(() => {
-    const getText = (sel) => document.querySelector(sel)?.textContent?.trim() || '';
-    const title = getText('h1, h1[aria-label], [data-testid="item-title"], [class*="ItemHeader_title"]');
-    // 価格は「¥12,345」形式を優先抽出
-    const priceCand = [
-      '[data-testid="item-price"]',
-      '[class*="Price_price"], [class*="ItemPrice_price"]',
-      'span, div'
-    ];
-    let price = '';
-    for (const sel of priceCand) {
-      const nodes = Array.from(document.querySelectorAll(sel));
-      for (const n of nodes) {
-        const t = n.textContent || '';
-        if (/¥\s*[0-9,.]+/.test(t)) { price = t.match(/¥\s*[0-9,.]+/)[0]; break; }
-      }
-      if (price) break;
-    }
+    const get = sel => document.querySelector(sel)?.textContent?.trim() || '';
+    const meta = p => document.querySelector(`meta[property="${p}"]`)?.content || '';
+    const title = get('h1, h1[aria-label], [data-testid="item-title"], [class*="ItemHeader_title"]') || meta('og:title') || document.title || '';
+    const body = (document.body?.innerText || '').replace(/\s+/g, ' ');
+    const m = body.match(/¥\s*[0-9,.]+/);
+    const price = m ? m[0] : (get('[data-testid="item-price"]') || get('[class*="Price_price"], [class*="ItemPrice_price"]'));
     return { title, price };
   });
 
-  // 最終整形
   const title = fromLd?.name || fromLd?.title || domData.title || '';
   const brand = typeof fromLd?.brand === 'string' ? fromLd.brand : (fromLd?.brand?.name || '');
   const offers = Array.isArray(fromLd?.offers) ? fromLd.offers[0] : fromLd?.offers;
   const currency = offers?.priceCurrency || 'JPY';
-  const priceNumber = (() => {
-    if (offers?.price) return Number(String(offers.price).replace(/[^0-9.]/g, ''));
-    const m = domData.price?.match(/([0-9,.]+)/);
-    return m ? Number(m[1].replace(/,/g, '')) : undefined;
-  })();
+  let priceNumber = offers?.price ? Number(String(offers.price).replace(/[^0-9.]/g, '')) : undefined;
+  if (!priceNumber && domData.price) {
+    const mm = domData.price.match(/([0-9,.]+)/);
+    if (mm) priceNumber = Number(mm[1].replace(/,/g, ''));
+  }
   const priceText = domData.price || (priceNumber ? `¥${priceNumber.toLocaleString('ja-JP')}` : '');
 
   const html = await page.content();
   await writeDebugHTML(html, 'mercari');
   await context.close();
 
-  if (!title || !priceText) {
-    return { ok: false, reason: 'playwright_incomplete' };
-  }
-
-  return {
-    ok: true,
-    via: 'playwright',
-    data: {
-      title,
-      brand,
-      price: priceText,
-      priceNumber,
-      currency,
-      description: '',
-    }
-  };
+  if (!title && !priceText) return { ok: false, reason: 'playwright_incomplete' };
+  return { ok: true, via: 'playwright', data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description: '' } };
 }
 
-// ---------- ルート ----------
-app.get('/health', (req, res) => {
-  res.json({ ok: true, ts: nowISO() });
-});
-
-// 認証不要のプリウォーム（必要なら requireApiKey を噛ませる）
-app.get('/warmup', async (_req, res) => {
-  try {
-    await getBrowser();
-    res.json({ ok: true, warmed: true, ts: nowISO() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
+app.get('/health', (_req, res) => { res.json({ ok: true, ts: nowISO() }); });
+app.get('/warmup', async (_req, res) => { try { await getBrowser(); res.json({ ok: true, warmed: true, ts: nowISO() }); } catch (e) { res.status(500).json({ ok: false, error: e?.message || String(e) }); } });
 
 app.post('/scrape', requireApiKey, async (req, res) => {
   const { url, type = 'mercari', quick = true } = req.body || {};
@@ -259,16 +200,16 @@ app.post('/scrape', requireApiKey, async (req, res) => {
   if (!/^https?:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'url must be http/https' });
 
   try {
-    // 1) まずはHTTP直取り（ON & quick時優先）
+    if (DIRECT_ONLY) {
+      const r0 = await directFetchMercari(url);
+      return r0.ok ? res.json({ ok: true, url, type, ...r0 }) : res.status(503).json({ ok: false, error: 'direct_only_miss' });
+    }
     if (DIRECT_FIRST && quick !== false) {
       const r = await directFetchMercari(url);
       if (r.ok) return res.json({ ok: true, url, type, ...r });
     }
-
-    // 2) Playwright フォールバック
     const r2 = await scrapeWithPlaywright(url);
     if (r2.ok) return res.json({ ok: true, url, type, ...r2 });
-
     return res.status(500).json({ ok: false, error: r2.reason || 'unknown_error' });
   } catch (e) {
     const msg = e?.message || String(e);
@@ -276,18 +217,10 @@ app.post('/scrape', requireApiKey, async (req, res) => {
   }
 });
 
-// ルート（任意）
 app.get('/', (_req, res) => res.json({ ok: true, service: 'mercari-scraper', ts: nowISO() }));
 
-// ---------- 終了時クリーンアップ ----------
-async function shutdown() {
-  try { const b = await browserPromise; await b?.close(); } catch (_) {}
-  process.exit(0);
-}
+async function shutdown() { try { const b = await browserPromise; await b?.close(); } catch {} process.exit(0); }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// ---------- 起動 ----------
-app.listen(PORT, () => {
-  console.log(`[mercari-scraper] listening on :${PORT} HEADLESS=${HEADLESS} DIRECT_FIRST=${DIRECT_FIRST}`);
-});
+app.listen(PORT, () => { console.log(`[mercari-scraper] listening on :${PORT} HEADLESS=${HEADLESS} DIRECT_FIRST=${DIRECT_FIRST}`); });
