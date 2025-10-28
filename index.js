@@ -51,6 +51,92 @@ function pickPriceFromText(txt) {
   return m ? { priceText: `¥ ${m[1]}`, priceNumber: Number(m[1].replace(/,/g,'')) } : null;
 }
 
+/* ===== ヘルパ（精度UP用：メタ順不同・タイトル/価格強化・JSONスキャン） ===== */
+function pickMetaContent(html, attr, value) {
+  const re1 = new RegExp(`<meta[^>]*${attr}=["']${value}["'][^>]*content=["']([^"']+)["'][^>]*>`, 'i');
+  const re2 = new RegExp(`<meta[^>]*content=["']([^"']+)["'][^>]*${attr}=["']${value}["'][^>]*>`, 'i');
+  const m = re1.exec(html) || re2.exec(html);
+  return m ? m[1].trim() : '';
+}
+function pickMetaAnyOrder(html, attrs) {
+  for (const [attr, value] of attrs) { const v = pickMetaContent(html, attr, value); if (v) return v; }
+  return '';
+}
+function pickTagText(html, tag) {
+  const m = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i').exec(html);
+  return m ? m[1].replace(/<[^>]*>/g,'').trim() : '';
+}
+function pickH1(html) {
+  const m = /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+  return m ? m[1].replace(/<[^>]*>/g,'').trim() : '';
+}
+function pickAllYen(html) {
+  const out = [];
+  const re = /¥\s*([0-9][0-9,]{2,})/g; // 3桁以上
+  let m;
+  while ((m = re.exec(html))) {
+    const n = Number(m[1].replace(/,/g,''));
+    if (!Number.isNaN(n)) out.push(n);
+  }
+  return out;
+}
+function extractBetweenLabels(html, startLabel, endLabel) {
+  const s = html.indexOf(startLabel);
+  if (s < 0) return '';
+  const cut = html.slice(s, s + 8000);
+  const endIdx = cut.indexOf(endLabel);
+  const chunk = endIdx > 0 ? cut.slice(0, endIdx) : cut;
+  return chunk.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').replace(startLabel,'').trim().slice(0, 1200);
+}
+function jsonBlocksFromScripts(html) {
+  const out = [];
+  const reScript = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = reScript.exec(html))) {
+    let txt = m[1].trim();
+    if (!txt) continue;
+    const brace = txt.indexOf('{');
+    if (brace >= 0) {
+      const cand = txt.slice(brace);
+      try { out.push(JSON.parse(cand)); } catch {}
+    }
+  }
+  return out;
+}
+function* walk(o) {
+  if (o && typeof o === 'object') {
+    yield o;
+    if (Array.isArray(o)) { for (const v of o) yield* walk(v); }
+    else { for (const k of Object.keys(o)) yield* walk(o[k]); }
+  }
+}
+function bestProductCandidate(objs) {
+  let best = null;
+  for (const root of objs) {
+    for (const node of walk(root)) {
+      const name = typeof node?.name === 'string' ? node.name
+                  : (typeof node?.title === 'string' ? node.title : '');
+      const rawPrice = node?.price ?? node?.priceAmount ?? node?.amount ?? (node?.offers?.price);
+      const priceNum = rawPrice != null ? Number(String(rawPrice).replace(/[^0-9.]/g,'')) : NaN;
+      if (name && !Number.isNaN(priceNum) && priceNum > 0) {
+        const score = Math.min(name.length, 80) + Math.log10(priceNum + 1) * 10;
+        if (!best || score > best.score) {
+          best = {
+            score,
+            name,
+            priceNum,
+            brand: (node?.brand?.name || node?.brand || ''),
+            desc: (node?.description || ''),
+            src: 'json'
+          };
+        }
+      }
+    }
+  }
+  return best;
+}
+
+/* ---------- 直取り（強化版） ---------- */
 async function directFetchMercari(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -142,7 +228,6 @@ async function directFetchMercari(url) {
     return { ok: false, reason: 'direct_incomplete' };
   } finally { clearTimeout(id); }
 }
-
 
 /* ---------- Playwright（起動短縮＋ブロック強化） ---------- */
 let browserPromise = null;
