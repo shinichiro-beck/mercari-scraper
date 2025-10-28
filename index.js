@@ -65,8 +65,14 @@ async function directFetchMercari(url) {
       },
     });
     const html = await res.text();
+    const headOnly = html.slice(0, 120000);
 
-    const ldBlocks = Array.from(html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)).map(m => m[1]);
+    // 1) __NEXT_DATA__ などの JSON を総なめ
+    const jsonObjs = jsonBlocksFromScripts(headOnly);
+    const cand = bestProductCandidate(jsonObjs);
+
+    // 2) JSON-LD（保険）
+    const ldBlocks = Array.from(headOnly.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)).map(m => m[1]);
     let product = null;
     for (const block of ldBlocks) {
       try {
@@ -88,43 +94,55 @@ async function directFetchMercari(url) {
       } catch {}
     }
 
-    const ogTitle = pickMeta(html, 'property=["\']og:title["\']');
-    const metaPrice = pickMetaAny(html, [
-      'property=["\']product:price:amount["\']',
-      'property=["\']og:price:amount["\']',
-      'itemprop=["\']price["\']',
-      'name=["\']price["\']'
+    // 3) タイトル候補
+    const ogTitle = pickMetaContent(headOnly, 'property', 'og:title');
+    const titleTag = pickTagText(headOnly, 'title');
+    const h1 = pickH1(headOnly);
+
+    // 4) 価格（JSON → JSON-LD → meta → 本文の最大¥）
+    const priceFromJson = cand?.priceNum ? { priceText: `¥ ${cand.priceNum.toLocaleString('ja-JP')}`, priceNumber: cand.priceNum } : null;
+    const priceFromLd   = product?.offers?.price ? { priceText: `¥ ${Number(product.offers.price).toLocaleString('ja-JP')}`, priceNumber: Number(product.offers.price) } : null;
+    const metaPriceRaw  = pickMetaAnyOrder(headOnly, [
+      ['property','product:price:amount'],
+      ['property','og:price:amount'],
+      ['itemprop','price'],
+      ['name','price']
     ]);
-    let priceFromMeta = null;
-    if (metaPrice) {
-      const n = Number(String(metaPrice).replace(/[^0-9.]/g,''));
-      if (!Number.isNaN(n) && n>0) priceFromMeta = { priceText: `¥ ${n.toLocaleString('ja-JP')}`, priceNumber: n };
-    }
+    const priceFromMeta = metaPriceRaw ? (() => {
+      const n = Number(String(metaPriceRaw).replace(/[^0-9.]/g,''));
+      return (!Number.isNaN(n) && n>0) ? { priceText: `¥ ${n.toLocaleString('ja-JP')}`, priceNumber: n } : null;
+    })() : null;
 
-    const fromBody = pickPriceFromText(html);
+    const nums = pickAllYen(headOnly);
+    const bodyMax = nums.length ? Math.max(...nums) : null;
+    const priceFromBody = bodyMax ? { priceText: `¥ ${bodyMax.toLocaleString('ja-JP')}`, priceNumber: bodyMax } : null;
 
-    const title = product?.name || product?.title || ogTitle || '';
-    const brand = typeof product?.brand === 'string' ? product?.brand : (product?.brand?.name || '');
-    const price = priceFromMeta || (product?.offers?.price ? { priceText: `¥ ${Number(product.offers.price).toLocaleString('ja-JP')}`, priceNumber: Number(product.offers.price) } : null) || fromBody;
+    const price = priceFromJson || priceFromLd || priceFromMeta || priceFromBody;
+
+    // 5) タイトル・ブランド・説明
+    const title = (cand?.name || product?.name || product?.title || ogTitle || h1 || titleTag || '').trim();
+    const brand = (cand?.brand || (typeof product?.brand === 'string' ? product?.brand : (product?.brand?.name || '')) || '').trim();
+    const description = (cand?.desc || extractBetweenLabels(html, '商品の説明', '商品の情報') || '').trim();
 
     if (price) {
       return {
         ok: true,
         via: 'direct',
         data: {
-          title: title,
-          brand: brand,
+          title,
+          brand,
           price: price.priceText,
           priceNumber: price.priceNumber,
           currency: 'JPY',
-          description: ''
+          description
         },
-        raw: { source: product ? 'ld+json' : (priceFromMeta ? 'meta' : 'body') }
+        raw: { source: cand ? 'json' : (product ? 'ld+json' : (priceFromMeta ? 'meta' : 'body-max')) }
       };
     }
     return { ok: false, reason: 'direct_incomplete' };
   } finally { clearTimeout(id); }
 }
+
 
 /* ---------- Playwright（起動短縮＋ブロック強化） ---------- */
 let browserPromise = null;
