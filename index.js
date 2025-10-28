@@ -331,9 +331,33 @@ async function scrapeWithPlaywright(url) {
   if (!title && !priceText) return { ok: false, reason: 'playwright_incomplete' };
   return { ok: true, via: 'playwright', data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description: '' } };
 }
+cd ~/Desktop/mercari-scraper
+cp index.js index.bak.$(date +%s)
 
+# 「ルート」ブロックの直前に品質ゲート関数を差し込み
+ed -s index.js <<'ED'
+/\/\* ---------- ルート ---------- \*\//
+i
+// --- direct結果の品質チェック（薄い結果はPlaywrightにフォールバック） ---
+function isDirectPlausible(r) {
+  try {
+    const d = r?.data || {};
+    const title = (d.title || '').trim();
+    const badTitle =
+      !title ||
+      title === 'メルカリ' ||         // サイト名だけはNG
+      title.length < 5;              // 短すぎるのもNG
+    const weirdDesc = (d.description || '').includes('","itemInformation":"'); // JSON断片がそのまま混入はNG
+    const fromBody  = String(r?.raw?.source || '').startsWith('body');         // 本文スキャンだけの時は
+    const lowWhenBody = fromBody && (d.priceNumber ?? 0) < 5000;               // 5,000未満なら誤検出疑い
 
-/* ---------- ルート ---------- */
+    return !(badTitle || weirdDesc || lowWhenBody);
+  } catch { return false; }
+}
+.
+w
+q
+ED
 app.get('/health', (_req, res) => res.json({ ok: true, ts: nowISO() }));
 app.get('/warmup', async (_req, res) => { try { await getBrowser(); res.json({ ok: true, warmed: true, ts: nowISO() }); } catch (e) { res.status(500).json({ ok: false, error: e?.message || String(e) }); } });
 
