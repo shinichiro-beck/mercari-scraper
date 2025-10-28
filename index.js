@@ -1,8 +1,5 @@
-cd ~/Desktop/mercari-scraper
-cp index.js index.bak.$(date +%s)
-cat > index.js <<'EOF'
 // =========================
-// mercari-scraper 高速版（直取り強化＋Playwright短縮＋直取りonlyパラメータ）
+// mercari-scraper 高速版（直取り強化＋Playwright短縮）
 // =========================
 import express from 'express';
 import { chromium } from 'playwright';
@@ -40,7 +37,7 @@ function withTimeout(promise, ms, message = 'Timeout') {
   });
 }
 
-// -------- 直取り（JSON-LD + meta + 全文パターン）強化 --------
+/* ---------- 直取り（JSON-LD + meta + 全文パターン） ---------- */
 function pickMeta(content, name) {
   const m = new RegExp(`<meta[^>]+${name}=["'][^"']*["'][^>]*content=["']([^"']+)["'][^>]*>`, 'i').exec(content);
   return m ? m[1].trim() : '';
@@ -69,7 +66,6 @@ async function directFetchMercari(url) {
     });
     const html = await res.text();
 
-    // 1) JSON-LD
     const ldBlocks = Array.from(html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)).map(m => m[1]);
     let product = null;
     for (const block of ldBlocks) {
@@ -92,7 +88,6 @@ async function directFetchMercari(url) {
       } catch {}
     }
 
-    // 2) meta/OG
     const ogTitle = pickMeta(html, 'property=["\']og:title["\']');
     const metaPrice = pickMetaAny(html, [
       'property=["\']product:price:amount["\']',
@@ -106,10 +101,8 @@ async function directFetchMercari(url) {
       if (!Number.isNaN(n) && n>0) priceFromMeta = { priceText: `¥ ${n.toLocaleString('ja-JP')}`, priceNumber: n };
     }
 
-    // 3) 本文からの円マッチ
     const fromBody = pickPriceFromText(html);
 
-    // 4) 最終整形（価格さえ取れれば成功にする）
     const title = product?.name || product?.title || ogTitle || '';
     const brand = typeof product?.brand === 'string' ? product?.brand : (product?.brand?.name || '');
     const price = priceFromMeta || (product?.offers?.price ? { priceText: `¥ ${Number(product.offers.price).toLocaleString('ja-JP')}`, priceNumber: Number(product.offers.price) } : null) || fromBody;
@@ -133,7 +126,7 @@ async function directFetchMercari(url) {
   } finally { clearTimeout(id); }
 }
 
-// -------- Playwright（起動短縮＋ブロッキング強化＋ステルス少々） --------
+/* ---------- Playwright（起動短縮＋ブロック強化） ---------- */
 let browserPromise = null;
 async function getBrowser() {
   if (browserPromise) {
@@ -158,28 +151,18 @@ async function scrapeWithPlaywright(url) {
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     extraHTTPHeaders: { 'Referer': 'https://www.google.com/', 'Accept-Language':'ja,en;q=0.8' }
   });
-
-  await context.addInitScript(() => {
-    try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
-  });
-
+  await context.addInitScript(() => { try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {} });
   await context.route('**/*', route => {
-    const req = route.request();
-    const t = req.resourceType();
-    const urlStr = req.url();
+    const req = route.request(); const t = req.resourceType(); const u = req.url();
     if (['image','font','media','stylesheet'].includes(t)) return route.abort();
-    if (/(googletagmanager|google-analytics|doubleclick|facebook|ads|criteo)\./i.test(urlStr)) return route.abort();
+    if (/(googletagmanager|google-analytics|doubleclick|facebook|ads|criteo)\./i.test(u)) return route.abort();
     route.continue();
   });
 
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
-
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
-  } catch {
-    await page.goto(url, { waitUntil: 'commit', timeout: Math.min(15000, NAV_TIMEOUT_MS) }).catch(() => {});
-  }
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }); }
+  catch { await page.goto(url, { waitUntil: 'commit', timeout: Math.min(15000, NAV_TIMEOUT_MS) }).catch(() => {}); }
 
   await page.waitForFunction(() => /¥\s*[0-9,.]+/.test(document.body?.innerText || ''), { timeout: 5000 }).catch(() => {});
   const domData = await page.evaluate(() => {
@@ -215,7 +198,7 @@ async function scrapeWithPlaywright(url) {
   }
 
   const brand = typeof fromLd?.brand === 'string' ? fromLd?.brand : (fromLd?.brand?.name || '');
-  const offers = Array.isArray(fromLd?.offers) ? fromLd?.offers[0] : fromLd?.offers;
+  const offers = Array.isArray(fromLd?.offers) ? fromLd.offers[0] : fromLd?.offers;
   const currency = offers?.priceCurrency || 'JPY';
   let priceNumber = offers?.price ? Number(String(offers.price).replace(/[^0-9.]/g, '')) : undefined;
   if (!priceNumber && domData.price) {
@@ -233,7 +216,7 @@ async function scrapeWithPlaywright(url) {
   return { ok: true, via: 'playwright', data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description: '' } };
 }
 
-// -------- ルート --------
+/* ---------- ルート ---------- */
 app.get('/health', (_req, res) => res.json({ ok: true, ts: nowISO() }));
 app.get('/warmup', async (_req, res) => { try { await getBrowser(); res.json({ ok: true, warmed: true, ts: nowISO() }); } catch (e) { res.status(500).json({ ok: false, error: e?.message || String(e) }); } });
 
@@ -267,4 +250,3 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 app.listen(PORT, () => { console.log(`[mercari-scraper] listening on :${PORT} HEADLESS=${HEADLESS} DIRECT_FIRST=${DIRECT_FIRST}`); });
-EOF
