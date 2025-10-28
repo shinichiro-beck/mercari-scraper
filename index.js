@@ -259,7 +259,7 @@ async function getBrowser() {
   return browserPromise;
 }
 
-async function scrapeWithPlaywright(url) {
+aasync function scrapeWithPlaywright(url) {
   const browser = await withTimeout(getBrowser(), 45_000, 'browserType.launch: Timeout');
   const context = await browser.newContext({
     locale: 'ja-JP',
@@ -283,7 +283,7 @@ async function scrapeWithPlaywright(url) {
   await page.waitForFunction(() => /¥\s*[0-9,.]+/.test(document.body?.innerText || ''), { timeout: 5000 }).catch(() => {});
   const domData = await page.evaluate(() => {
     const get = sel => document.querySelector(sel)?.textContent?.trim() || '';
-    const meta = p => document.querySelector(`meta[property="\${p}"]`)?.content || '';
+    const meta = p => document.querySelector(`meta[property="${p}"]`)?.content || '';
     const title = get('h1, h1[aria-label], [data-testid="item-title"], [class*="ItemHeader_title"]') || meta('og:title') || document.title || '';
     const body = (document.body?.innerText || '').replace(/\s+/g,' ');
     const m = body.match(/¥\s*[0-9,.]+/);
@@ -328,9 +328,10 @@ async function scrapeWithPlaywright(url) {
   await writeDebugHTML(html, 'mercari');
   await context.close();
 
-  if (!title && !priceText) return { ok: false, reason: 'playwright_incomplete' });
+  if (!title && !priceText) return { ok: false, reason: 'playwright_incomplete' };
   return { ok: true, via: 'playwright', data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description: '' } };
 }
+
 
 /* ---------- ルート ---------- */
 app.get('/health', (_req, res) => res.json({ ok: true, ts: nowISO() }));
