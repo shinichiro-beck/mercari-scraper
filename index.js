@@ -2,9 +2,10 @@
  * mercari-scraper — 完全版 index.js
  * - Express API
  * - 認証: x-api-key
- * - 直取り + Playwright(ステルス & プロキシ対応)
- * - /scrape, /scrapeBoth, /warmup, /ip, /health
- * - Render 環境変数に優しく: NAV_TIMEOUT_OVERRIDE_MS で上書き可能
+ * - 直取り + Playwright(ステルス/プロキシ/ローテーション対応)
+ * - ルート順序を明確化（404フォールバックは最後）
+ * - /scrape, /scrapeBoth, /warmup, /ip, /health, /__routes(診断)
+ * - NAV_TIMEOUT_OVERRIDE_MS でタイムアウト上書き可能
  */
 
 /* ========================
@@ -71,7 +72,7 @@ const isIncomplete = (d) => {
 };
 const isSuspiciousPrice = (n) => Number.isFinite(n) && n < 1000; // 誤検出対策（必要に応じ調整）
 
-// HTMLユーティリティ（依存なし）
+// HTMLユーティリティ
 const extractBetween = (html, re, map = (x) => x) => {
   const m = re.exec(html);
   if (!m) return null;
@@ -92,9 +93,7 @@ const parseAllLdJson = (html) => {
       const json = JSON.parse(txt);
       if (Array.isArray(json)) out.push(...json);
       else out.push(json);
-    } catch {
-      // JSON崩れは無視
-    }
+    } catch { /* noop */ }
   }
   return out;
 };
@@ -125,7 +124,7 @@ let launchedAt = 0;
 const expandProxyServer = (template) => {
   if (!template) return '';
   const session = Math.random().toString(36).slice(2, 10);
-  return template.replaceAll('{session}', session);
+  return template.replace(/{session}/g, session);
 };
 
 async function getBrowser(forceRotate = false) {
@@ -139,9 +138,7 @@ async function getBrowser(forceRotate = false) {
   if (!needRotate) return sharedBrowser;
 
   if (sharedBrowser) {
-    try {
-      await sharedBrowser.close();
-    } catch {}
+    try { await sharedBrowser.close(); } catch {}
     sharedBrowser = null;
   }
 
@@ -152,11 +149,7 @@ async function getBrowser(forceRotate = false) {
 
   sharedBrowser = await chromium.launch(launchOpts);
   launchedAt = now;
-
-  sharedBrowser.on('disconnected', () => {
-    sharedBrowser = null;
-  });
-
+  sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
   return sharedBrowser;
 }
 
@@ -170,8 +163,7 @@ async function fetchText(url) {
     const res = await fetch(url, {
       signal: ac.signal,
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
         'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
         'Cache-Control': 'no-cache',
       },
@@ -207,8 +199,7 @@ async function directFetchMercari(url) {
       // 保険：本文から最大の金額を拾う
       const txt = html.replace(/<[^>]+>/g, ' ');
       const re = /¥\s?([\d,]{2,})/g;
-      let best = 0,
-        m;
+      let best = 0, m;
       while ((m = re.exec(txt))) {
         const n = Number(String(m[1]).replace(/[^\d]/g, ''));
         if (n > best) best = n;
@@ -220,7 +211,7 @@ async function directFetchMercari(url) {
       (product?.offers && (Array.isArray(product.offers) ? product.offers[0]?.priceCurrency : product.offers?.priceCurrency)) ||
       'JPY';
 
-    // description は難しいので最長っぽい段落を採用
+    // description：最長段落を採用（簡易）
     let description = null;
     {
       const plain = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ');
@@ -229,11 +220,7 @@ async function directFetchMercari(url) {
       if (description && description.length < 80) description = null;
     }
 
-    return {
-      ok: true,
-      via: 'direct',
-      data: { title, brand, price, priceNumber: priceNumber ?? null, currency, description },
-    };
+    return { ok: true, via: 'direct', data: { title, brand, price, priceNumber: priceNumber ?? null, currency, description } };
   } catch (e) {
     return { ok: false, via: 'direct', error: String(e && e.message ? e.message : e) };
   }
@@ -269,11 +256,7 @@ async function directFetchMaker(url) {
       if (description && description.length < 80) description = null;
     }
 
-    return {
-      ok: true,
-      via: 'direct',
-      data: { title, brand, price, priceNumber: priceNumber ?? null, currency, description },
-    };
+    return { ok: true, via: 'direct', data: { title, brand, price, priceNumber: priceNumber ?? null, currency, description } };
   } catch (e) {
     return { ok: false, via: 'direct', error: String(e && e.message ? e.message : e) };
   }
@@ -287,8 +270,7 @@ async function scrapeWithPlaywright(url, type = 'mercari') {
   const browser = await getBrowser(false);
 
   const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
     locale: 'ja-JP',
     timezoneId: 'Asia/Tokyo',
     viewport: { width: 1366, height: 900 },
@@ -298,7 +280,7 @@ async function scrapeWithPlaywright(url, type = 'mercari') {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja'] });
-    Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+    Object.defineProperty(navigator, 'platform',  { get: () => 'MacIntel' });
     window.chrome = { runtime: {} };
     const origQuery = navigator.permissions && navigator.permissions.query;
     if (origQuery) {
@@ -310,7 +292,7 @@ async function scrapeWithPlaywright(url, type = 'mercari') {
       };
     }
     const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function (p) {
+    WebGLRenderingContext.prototype.getParameter = function(p) {
       if (p === 37445) return 'Intel Inc.';
       if (p === 37446) return 'Intel Iris OpenGL Engine';
       return getParameter.apply(this, [p]);
@@ -347,7 +329,7 @@ async function scrapeWithPlaywright(url, type = 'mercari') {
           const t = String(obj['@type'] || '').toLowerCase();
           if (t.includes('product')) return obj;
         }
-      } catch {}
+      } catch { /* noop */ }
     }
     return null;
   };
@@ -358,9 +340,7 @@ async function scrapeWithPlaywright(url, type = 'mercari') {
         const dom = document.querySelector('#__NEXT_DATA__');
         if (dom) return JSON.parse(dom.textContent || '{}');
       } catch {}
-      try {
-        return window.__NEXT_DATA__ || null;
-      } catch {}
+      try { return window.__NEXT_DATA__ || null; } catch {}
       return null;
     });
     if (!root) return null;
@@ -432,8 +412,7 @@ async function scrapeWithPlaywright(url, type = 'mercari') {
       const biggest = await page.evaluate(() => {
         const txt = document.body?.innerText || '';
         const re = /¥\s?([\d,]{2,})/g;
-        let best = 0,
-          m;
+        let best = 0, m;
         while ((m = re.exec(txt))) {
           const n = Number(String(m[1]).replace(/[^\d]/g, ''));
           if (n > best) best = n;
@@ -487,18 +466,20 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+/* ========================
+ *  Route Order (重要！)
+ * ======================*/
+
+// ① 基本ルート
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'mercari-scraper', ts: new Date().toISOString() });
 });
-
 app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
-
 app.get('/warmup', async (_req, res) => {
   try {
-    const browser = await getBrowser(true); // 起動を確実に
-    // 軽く1コンテキスト作って閉じる
+    const browser = await getBrowser(true);
     const ctx = await browser.newContext();
     await ctx.close().catch(() => {});
     res.json({ ok: true, warmed: true, ts: new Date().toISOString() });
@@ -507,7 +488,7 @@ app.get('/warmup', async (_req, res) => {
   }
 });
 
-// デバッグ: Playwright 経由の出口IP確認
+// ② 追加ルート（主役）
 app.get('/ip', async (_req, res) => {
   try {
     const browser = await getBrowser();
@@ -515,19 +496,18 @@ app.get('/ip', async (_req, res) => {
     const page = await context.newPage();
     await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 15000 });
     const txt = await page.evaluate(() => document.body.innerText || '');
-    await context.close().catch(() => {});
-    res.json({ ok: true, ip: JSON.parse(txt).ip });
+    await context.close().catch(()=>{});
+    try {
+      const obj = JSON.parse(txt);
+      return res.json({ ok: true, ip: obj.ip });
+    } catch {
+      return res.json({ ok: true, ipRaw: (txt || '').slice(0, 500) });
+    }
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
+    return res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
   }
 });
 
-// 誤用ガード
-app.get('/scrape', (_req, res) => {
-  res.status(405).json({ ok: false, error: 'Method Not Allowed. Use POST /scrape' });
-});
-
-// メイン：/scrape
 app.post('/scrape', requireApiKey, async (req, res) => {
   try {
     const { url, type = 'mercari', quick = true, directOnly = false } = req.body || {};
@@ -536,14 +516,9 @@ app.post('/scrape', requireApiKey, async (req, res) => {
     const enforceDirectOnly = directOnly || DIRECT_ONLY_SWITCH;
 
     // 直取り
-    const doDirect = async () => {
-      return type === 'maker' ? await directFetchMaker(url) : await directFetchMercari(url);
-    };
-
+    const doDirect = async () => (type === 'maker' ? await directFetchMaker(url) : await directFetchMercari(url));
     // Playwright
-    const doPlaywright = async () => {
-      return await scrapeWithPlaywright(url, type);
-    };
+    const doPlaywright = async () => await scrapeWithPlaywright(url, type);
 
     let result = null;
 
@@ -553,19 +528,11 @@ app.post('/scrape', requireApiKey, async (req, res) => {
         return res.json({ ok: true, url, type, via: d.via, data: d.data });
       }
       if (enforceDirectOnly) {
-        return res.json({
-          ok: Boolean(d.ok),
-          url,
-          type,
-          via: 'direct',
-          data: d.data || null,
-          error: d.error || 'direct_incomplete',
-        });
+        return res.json({ ok: Boolean(d.ok), url, type, via: 'direct', data: d.data || null, error: d.error || 'direct_incomplete' });
       }
       // フォールバック
       result = await doPlaywright();
       if (!result.ok) {
-        // 直取り結果を添えて返す（デバッグしやすく）
         return res.json({ ok: false, url, type, via: 'playwright', error: result.error || 'playwright_failed', data: result.data || d.data || null });
       }
       return res.json({ ok: true, url, type, via: result.via, data: result.data });
@@ -588,174 +555,6 @@ app.post('/scrape', requireApiKey, async (req, res) => {
   }
 });
 
-// 拡張：/scrapeBoth（並列 + タイムアウト）
-const BOTH_JOB_TIMEOUT_MS = Number(process.env.BOTH_JOB_TIMEOUT_MS || 18000);
-const BOTH_TOTAL_TIMEOUT_MS = Number(process.env.BOTH_TOTAL_TIMEOUT_MS || 30000);
-
-const withTimeout = (p, ms, label) =>
-  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout:${label}`)), ms))]);
-
-app.post('/scrapeBoth', requireApiKey, async (req, res) => {
-  try {
-    const { mercariUrl, makerUrl } = req.body || {};
-    if (!mercariUrl && !makerUrl) {
-      return res.status(400).json({ ok: false, error: 'mercariUrl or makerUrl is required' });
-    }
-
-    const mercariJob = mercariUrl
-      ? (async () => {
-          const d = await directFetchMercari(mercariUrl);
-          if (d.ok && !isIncomplete(d.data) && !isSuspiciousPrice(d.data.priceNumber)) return d.data;
-          const r = await scrapeWithPlaywright(mercariUrl, 'mercari');
-          return r.ok ? r.data : d.data || null;
-        })()
-      : Promise.resolve(null);
-
-    const makerJob = makerUrl
-      ? (async () => {
-          const d2 = await directFetchMaker(makerUrl);
-          return d2.data || null;
-        })()
-      : Promise.resolve(null);
-
-    const all = Promise.allSettled([
-      withTimeout(mercariJob, BOTH_JOB_TIMEOUT_MS, 'mercari'),
-      withTimeout(makerJob, BOTH_JOB_TIMEOUT_MS, 'maker'),
-    ]);
-
-    const [mRes, kRes] = await withTimeout(all, BOTH_TOTAL_TIMEOUT_MS, 'scrapeBoth_total');
-
-    const mercari = mRes.status === 'fulfilled' ? mRes.value : null;
-    const maker = kRes.status === 'fulfilled' ? kRes.value : null;
-
-    const merged = (() => {
-      const m = mercari || {};
-      const k = maker || {};
-      const brand = sanitize(m.brand || k.brand);
-      const productName = sanitize((k.title || '').replace(/\s+/g, ' ')) || sanitize(m.title);
-      const priceNumber = Number.isFinite(m.priceNumber) ? m.priceNumber : (Number.isFinite(k.priceNumber) ? k.priceNumber : null);
-      const price = Number.isFinite(priceNumber) ? formatJPY(priceNumber) : null;
-      const currency = m.currency || k.currency || 'JPY';
-      const condition = sanitize(m.condition || null) || null;
-      const description_user = sanitize(m.description || null) || null;
-      const specs_official = Array.isArray(k.specs_official) ? k.specs_official : [];
-      const features_official = Array.isArray(k.features_official) ? k.features_official : [];
-      return { brand, productName, price, priceNumber, currency, condition, description_user, specs_official, features_official };
-    })();
-
-    const sourceStatus = {
-      mercari: mRes.status === 'fulfilled' ? 'ok' : (mRes.reason?.message || 'error'),
-      maker: kRes.status === 'fulfilled' ? 'ok' : (kRes.reason?.message || 'error'),
-    };
-
-    return re
-cd ~/Desktop/mercari-scraper
-cp -a index.js index.js.bak.$(date +%Y%m%d%H%M%S)
-
-# ここで index.js の末尾に追記
-cat >> index.js <<'JS'
-
-// --- Added routes: /ip (JSON保証) ---
-app.get('/ip', async (_req, res) => {
-  try {
-    const browser = await getBrowser();
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const txt = await page.evaluate(() => document.body.innerText || '');
-    await context.close().catch(()=>{});
-    try {
-      const obj = JSON.parse(txt);
-      return res.json({ ok: true, ip: obj.ip });
-    } catch {
-      return res.json({ ok: true, ipRaw: (txt || '').slice(0, 500) });
-    }
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
-  }
-});
-
-// --- Added route: /scrapeBoth（自己完結版・常にJSON返却） ---
-app.post('/scrapeBoth', requireApiKey, async (req, res) => {
-  const safeJson = (status, payload) => {
-    try { res.status(status).json(payload); }
-    catch { try { res.status(500).end('{"ok":false,"error":"serialize_error"}'); } catch {}
-    }
-  };
-
-  try {
-    const { mercariUrl, makerUrl } = req.body || {};
-    if (!mercariUrl && !makerUrl) {
-      return safeJson(400, { ok: false, error: 'mercariUrl or makerUrl is required' });
-    }
-
-    const withTimeout = (p, ms, label) =>
-      Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout:' + label)), ms))]);
-
-    const jobTimeout   = Number(process.env.BOTH_JOB_TIMEOUT_MS   || 18000);
-    const totalTimeout = Number(process.env.BOTH_TOTAL_TIMEOUT_MS || 30000);
-
-    const mercariJob = mercariUrl ? (async () => {
-      const d = await directFetchMercari(mercariUrl);
-      if (d.ok && !isIncomplete(d.data) && !isSuspiciousPrice(d.data.priceNumber)) return d.data;
-      const r = await scrapeWithPlaywright(mercariUrl, 'mercari');
-      return r.ok ? r.data : (d.data || null);
-    })() : Promise.resolve(null);
-
-    const makerJob = makerUrl ? (async () => {
-      const d2 = await directFetchMaker(makerUrl);
-      return d2.data || null;
-    })() : Promise.resolve(null);
-
-    const all = Promise.allSettled([
-      withTimeout(mercariJob, jobTimeout, 'mercari'),
-      withTimeout(makerJob,   jobTimeout, 'maker'),
-    ]);
-
-    const [mRes, kRes] = await withTimeout(all, totalTimeout, 'scrapeBoth_total');
-    const mercari = mRes.status === 'fulfilled' ? mRes.value : null;
-    const maker   = kRes.status === 'fulfilled' ? kRes.value : null;
-
-    const merged = (() => {
-      const m = mercari || {}, k = maker || {};
-      const brand = (m.brand || k.brand) || null;
-      const productName = (k.title ? String(k.title).replace(/\s+/g,' ') : null) || (m.title || null);
-      const pn = Number.isFinite(m.priceNumber) ? m.priceNumber : (Number.isFinite(k.priceNumber) ? k.priceNumber : null);
-      const price = Number.isFinite(pn) ? `¥ ${pn.toLocaleString('ja-JP')}` : null;
-      const currency = m.currency || k.currency || 'JPY';
-      const condition = m.condition || null;
-      const description_user = m.description || null;
-      const specs_official = Array.isArray(k.specs_official) ? k.specs_official : [];
-      const features_official = Array.isArray(k.features_official) ? k.features_official : [];
-      return { brand, productName, price, priceNumber: pn ?? null, currency, condition, description_user, specs_offic
-cd ~/Desktop/mercari-scraper
-cp -a index.js index.js.bak.$(date +%Y%m%d%H%M%S)
-
-# 末尾に追記
-cat >> index.js <<'JS'
-
-// --- /ip: Playwright経由の外向きIPを「必ずJSON」で返す ---
-app.get('/ip', async (_req, res) => {
-  try {
-    const browser = await getBrowser();
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const txt = await page.evaluate(() => document.body.innerText || '');
-    await context.close().catch(()=>{});
-    try {
-      const obj = JSON.parse(txt);
-      return res.json({ ok: true, ip: obj.ip });
-    } catch {
-      // HTMLなどでも落とさない
-      return res.json({ ok: true, ipRaw: (txt || '').slice(0, 500) });
-    }
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
-  }
-});
-
-// --- /scrapeBoth: mercari + maker を並列で取り、必ずJSONで返す ---
 app.post('/scrapeBoth', requireApiKey, async (req, res) => {
   const safeJson = (status, payload) => {
     try { res.status(status).json(payload); }
@@ -819,4 +618,32 @@ app.post('/scrapeBoth', requireApiKey, async (req, res) => {
     return safeJson(500, { ok: false, error: String(e && e.message ? e.message : e) });
   }
 });
-JS
+
+// ③ 誤用ガード（GET /scrape は 405）
+app.get('/scrape', (_req, res) => {
+  res.status(405).json({ ok: false, error: 'Method Not Allowed. Use POST /scrape' });
+});
+
+// （診断用）登録ルート一覧
+app.get('/__routes', (req, res) => {
+  const routes = [];
+  (app._router?.stack || []).forEach((mw) => {
+    if (mw.route) {
+      const methods = Object.keys(mw.route.methods || {}).map(m => m.toUpperCase()).join(',');
+      routes.push({ path: mw.route.path, methods });
+    }
+  });
+  res.json({ ok: true, routes });
+});
+
+// ④ 最後に 404 フォールバック（これより前に全ルートを置くこと）
+app.use((req, res) => res.status(404).json({ ok: false, error: 'Not found' }));
+
+/* ========================
+ *  Start
+ * ======================*/
+app.listen(PORT, () => {
+  console.log(`[mercari-scraper] listening on :${PORT} HEADLESS=${HEADLESS} DIRECT_FIRST=${DIRECT_FIRST} DIRECT_ONLY=${DIRECT_ONLY_SWITCH}`);
+  console.log(`[mercari-scraper] timeouts: NAV=${NAV_TIMEOUT_MS}ms FETCH=${FETCH_TIMEOUT_MS}ms`);
+  if (PROXY_SERVER) console.log(`[mercari-scraper] proxy: enabled (rotate ${PROXY_ROTATE_MS}ms)`);
+});
