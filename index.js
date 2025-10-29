@@ -728,3 +728,95 @@ app.post('/scrapeBoth', requireApiKey, async (req, res) => {
       const specs_official = Array.isArray(k.specs_official) ? k.specs_official : [];
       const features_official = Array.isArray(k.features_official) ? k.features_official : [];
       return { brand, productName, price, priceNumber: pn ?? null, currency, condition, description_user, specs_offic
+cd ~/Desktop/mercari-scraper
+cp -a index.js index.js.bak.$(date +%Y%m%d%H%M%S)
+
+# 末尾に追記
+cat >> index.js <<'JS'
+
+// --- /ip: Playwright経由の外向きIPを「必ずJSON」で返す ---
+app.get('/ip', async (_req, res) => {
+  try {
+    const browser = await getBrowser();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto('https://api.ipify.org?format=json', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const txt = await page.evaluate(() => document.body.innerText || '');
+    await context.close().catch(()=>{});
+    try {
+      const obj = JSON.parse(txt);
+      return res.json({ ok: true, ip: obj.ip });
+    } catch {
+      // HTMLなどでも落とさない
+      return res.json({ ok: true, ipRaw: (txt || '').slice(0, 500) });
+    }
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
+});
+
+// --- /scrapeBoth: mercari + maker を並列で取り、必ずJSONで返す ---
+app.post('/scrapeBoth', requireApiKey, async (req, res) => {
+  const safeJson = (status, payload) => {
+    try { res.status(status).json(payload); }
+    catch { try { res.status(500).end('{"ok":false,"error":"serialize_error"}'); } catch {} }
+  };
+
+  try {
+    const { mercariUrl, makerUrl } = req.body || {};
+    if (!mercariUrl && !makerUrl) {
+      return safeJson(400, { ok: false, error: 'mercariUrl or makerUrl is required' });
+    }
+
+    const withTimeout = (p, ms, label) =>
+      Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout:' + label)), ms))]);
+
+    const JOB_TO   = Number(process.env.BOTH_JOB_TIMEOUT_MS   || 18000);
+    const TOTAL_TO = Number(process.env.BOTH_TOTAL_TIMEOUT_MS || 30000);
+
+    const mercariJob = mercariUrl ? (async () => {
+      const d = await directFetchMercari(mercariUrl);
+      if (d.ok && !isIncomplete(d.data) && !isSuspiciousPrice(d.data.priceNumber)) return d.data;
+      const r = await scrapeWithPlaywright(mercariUrl, 'mercari');
+      return r.ok ? r.data : (d.data || null);
+    })() : Promise.resolve(null);
+
+    const makerJob = makerUrl ? (async () => {
+      const d2 = await directFetchMaker(makerUrl);
+      return d2.data || null;
+    })() : Promise.resolve(null);
+
+    const all = Promise.allSettled([
+      withTimeout(mercariJob, JOB_TO, 'mercari'),
+      withTimeout(makerJob,   JOB_TO, 'maker'),
+    ]);
+
+    const [mRes, kRes] = await withTimeout(all, TOTAL_TO, 'scrapeBoth_total');
+    const mercari = mRes.status === 'fulfilled' ? mRes.value : null;
+    const maker   = kRes.status === 'fulfilled' ? kRes.value : null;
+
+    const merged = (() => {
+      const m = mercari || {}, k = maker || {};
+      const brand = (m.brand || k.brand) || null;
+      const productName = (k.title ? String(k.title).replace(/\s+/g,' ') : null) || (m.title || null);
+      const pn = Number.isFinite(m.priceNumber) ? m.priceNumber : (Number.isFinite(k.priceNumber) ? k.priceNumber : null);
+      const price = Number.isFinite(pn) ? `¥ ${pn.toLocaleString('ja-JP')}` : null;
+      const currency = m.currency || k.currency || 'JPY';
+      const condition = m.condition || null;
+      const description_user = m.description || null;
+      const specs_official = Array.isArray(k.specs_official) ? k.specs_official : [];
+      const features_official = Array.isArray(k.features_official) ? k.features_official : [];
+      return { brand, productName, price, priceNumber: pn ?? null, currency, condition, description_user, specs_official, features_official };
+    })();
+
+    const sourceStatus = {
+      mercari: mRes.status === 'fulfilled' ? 'ok' : (mRes.reason?.message || 'error'),
+      maker:   kRes.status === 'fulfilled' ? 'ok' : (kRes.reason?.message || 'error'),
+    };
+
+    return safeJson(200, { ok: true, data: { mercari, maker, merged }, sourceStatus });
+  } catch (e) {
+    return safeJson(500, { ok: false, error: String(e && e.message ? e.message : e) });
+  }
+});
+JS
