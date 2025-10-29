@@ -647,3 +647,19 @@ app.listen(PORT, () => {
   console.log(`[mercari-scraper] timeouts: NAV=${NAV_TIMEOUT_MS}ms FETCH=${FETCH_TIMEOUT_MS}ms`);
   if (PROXY_SERVER) console.log(`[mercari-scraper] proxy: enabled (rotate ${PROXY_ROTATE_MS}ms)`);
 });
+// ====== Diagnostics: list registered routes ======
+app.get('/__routes', (req, res) => {
+  const routes = [];
+  (app._router?.stack || []).forEach(mw => {
+    if (mw.route) {
+      const methods = Object.keys(mw.route.methods || {}).map(m => m.toUpperCase()).sort().join(',');
+      routes.push({ path: mw.route.path, methods });
+    }
+  });
+  res.json({ ok: true, routes });
+});
+
+// ====== 404 fallback (MUST be the last middleware) ======
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'Not found' });
+});
