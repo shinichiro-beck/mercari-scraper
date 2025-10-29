@@ -248,7 +248,7 @@ async function scrapeWithPlaywright(url) {
     const mm = domData.price.match(/([0-9,.]+)/);
     if (mm) priceNumber = Number(mm[1].replace(/,/g, ''));
   }
-  const priceText = domData.price || (priceNumber ? `¥ ${priceNumber.toLocaleString('ja-JP')}` : '');
+  const priceText = (priceNumber ? `¥ ${priceNumber.toLocaleString('ja-JP')}` : (domData.price || ''));
   const title = fromLd?.name || fromLd?.title || domData.title || '';
 
   const html = await page.content();
