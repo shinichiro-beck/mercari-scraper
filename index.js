@@ -1,5 +1,5 @@
 // =========================
-// mercari-scraper 高速版（直取り強化＋Playwright短縮）
+// mercari-scraper 完全版（直取り＋品質ゲート＋Playwrightフォールバック）
 // =========================
 import express from 'express';
 import { chromium } from 'playwright';
@@ -8,13 +8,13 @@ import fs from 'fs/promises';
 // ---------- 環境変数 ----------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
 const API_KEY = process.env.API_KEY || '';
-const HEADLESS = process.env.HEADLESS !== '0';
-const DIRECT_FIRST = process.env.DIRECT_FIRST !== '0';   // true: まず直取りを試す
-const DIRECT_ONLY_ENV = process.env.DIRECT_ONLY === '1'; // true: 直取りのみで返す
+const HEADLESS = process.env.HEADLESS !== '0';          // Render 等は基本 true
+const DIRECT_FIRST = process.env.DIRECT_FIRST !== '0';  // true: 直取りを先に試す
+const DIRECT_ONLY_ENV = process.env.DIRECT_ONLY === '1';// 直取りだけで返す高速スイッチ
 const FETCH_TIMEOUT_MS = process.env.FETCH_TIMEOUT_MS ? Number(process.env.FETCH_TIMEOUT_MS) : 7000;
-const NAV_TIMEOUT_MS = process.env.NAV_TIMEOUT_MS ? Number(process.env.NAV_TIMEOUT_MS) : 25000;
+const NAV_TIMEOUT_MS   = process.env.NAV_TIMEOUT_MS   ? Number(process.env.NAV_TIMEOUT_MS)   : 25000;
 
-// ---------- 基本セット ----------
+// ---------- Express 基本 ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
@@ -31,7 +31,9 @@ function requireApiKey(req, res, next) {
 }
 
 function nowISO() { return new Date().toISOString(); }
-async function writeDebugHTML(html, tag = 'mercari') { try { await fs.writeFile(`/tmp/last_${tag}.html`, html ?? '', 'utf8'); } catch {} }
+async function writeDebugHTML(html, tag = 'mercari') {
+  try { await fs.writeFile(`/tmp/last_${tag}.html`, html ?? '', 'utf8'); } catch {}
+}
 function withTimeout(promise, ms, message = 'Timeout') {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${message} ${ms}ms exceeded`)), ms);
@@ -39,15 +41,19 @@ function withTimeout(promise, ms, message = 'Timeout') {
   });
 }
 
-// ---------- 直取りユーティリティ ----------
-function pickMeta(html, selectorPattern) {
-  const re = new RegExp(`<meta[^>]+${selectorPattern}[^>]*content=["']([^"']+)["'][^>]*>`, 'i');
+// ---------- HTML メタ抽出（直取り用の軽量パーサ） ----------
+function pickMetaContent(html, attr, value) {
+  // 例: (property, 'og:title'), (name,'description'), (itemprop,'price')
+  const re = new RegExp(
+    `<meta[^>]*\\b${attr}\\s*=\\s*["']${value}["'][^>]*\\bcontent\\s*=\\s*["']([^"']+)["'][^>]*>`,
+    'i'
+  );
   const m = re.exec(html);
   return m ? m[1].trim() : '';
 }
-function pickMetaAny(html, patterns) {
-  for (const p of patterns) {
-    const v = pickMeta(html, p);
+function pickFirstMeta(html, list) {
+  for (const [attr, val] of list) {
+    const v = pickMetaContent(html, attr, val);
     if (v) return v;
   }
   return '';
@@ -57,7 +63,7 @@ function pickPriceFromText(txt) {
   return m ? { priceText: `¥ ${m[1]}`, priceNumber: Number(m[1].replace(/,/g,'')) } : null;
 }
 
-// ---------- 直取り（JSON-LD + meta + 本文パターン） ----------
+// ---------- 直取り（JSON-LD + meta + 本文スキャン） ----------
 async function directFetchMercari(url) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -73,22 +79,25 @@ async function directFetchMercari(url) {
     });
     const html = await res.text();
 
-    // JSON-LD(Product) を拾う
-    const ldBlocks = Array.from(html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)).map(m => m[1]);
+    // ---- JSON-LD Product を探す
+    const ldBlocks = Array.from(html.matchAll(
+      /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
+    )).map(m => m[1]);
+
     let product = null;
     for (const block of ldBlocks) {
       try {
         const json = JSON.parse(block.trim());
-        const items = Array.isArray(json) ? json : [json];
-        for (const it of items) {
+        const arr = Array.isArray(json) ? json : [json];
+        for (const it of arr) {
           const graph = Array.isArray(it?.['@graph']) ? it['@graph'] : [it];
           for (const g of graph) {
             const t = g?.['@type'];
             if (t === 'Product' || (Array.isArray(t) && t.includes('Product'))) { product = g; break; }
           }
           if (!product) {
-            const t = it?.['@type'];
-            if (t === 'Product' || (Array.isArray(t) && t.includes('Product'))) { product = it; }
+            const t2 = it?.['@type'];
+            if (t2 === 'Product' || (Array.isArray(t2) && t2.includes('Product'))) { product = it; }
           }
           if (product) break;
         }
@@ -96,54 +105,50 @@ async function directFetchMercari(url) {
       } catch {}
     }
 
-    // メタ系
-    const ogTitle = pickMeta(html, 'property=["\']og:title["\']');
-    const ogDesc  = pickMeta(html, 'property=["\']og:description["\']') || pickMeta(html, 'name=["\']description["\']');
-
-    const metaPrice = pickMetaAny(html, [
-      'property=["\']product:price:amount["\']',
-      'property=["\']og:price:amount["\']',
-      'itemprop=["\']price["\']',
-      'name=["\']price["\']'
+    // ---- メタ
+    const ogTitle = pickMetaContent(html, 'property', 'og:title');
+    const metaPriceRaw = pickFirstMeta(html, [
+      ['property','product:price:amount'],
+      ['property','og:price:amount'],
+      ['itemprop','price'],
+      ['name','price'],
     ]);
     let priceFromMeta = null;
-    if (metaPrice) {
-      const n = Number(String(metaPrice).replace(/[^0-9.]/g,''));
+    if (metaPriceRaw) {
+      const n = Number(String(metaPriceRaw).replace(/[^0-9.]/g,''));
       if (!Number.isNaN(n) && n > 0) priceFromMeta = { priceText: `¥ ${n.toLocaleString('ja-JP')}`, priceNumber: n };
     }
 
-    // 本文 → 価格＆説明のフォールバック
-    const fromBodyPrice = pickPriceFromText(html);
-    const bodyText = html
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/p>/gi, '\n')
-      .replace(/<[^>]+>/g, '');
-    let bodyDesc = '';
-    {
-      const m = bodyText.match(/商品の説明\s*([\s\S]{10,2000}?)(?:\n\s*(?:商品の情報|カテゴリ|カテゴリー|ブランド|サイズ|色|配送|配送料|発送|コメント|購入|出品者|メルカリ)\b|$)/);
-      if (m) bodyDesc = m[1].trim();
-    }
+    // ---- 本文スキャン（fallback）
+    const fromBody = pickPriceFromText(html);
 
-    // 組み立て
+    // ---- タイトル・ブランド・価格
     const title = product?.name || product?.title || ogTitle || '';
     const brand = typeof product?.brand === 'string' ? product?.brand : (product?.brand?.name || '');
     const price = priceFromMeta
-      || (product?.offers?.price ? { priceText: `¥ ${Number(product.offers.price).toLocaleString('ja-JP')}`, priceNumber: Number(product.offers.price) } : null)
-      || fromBodyPrice;
+      || (product?.offers?.price
+            ? { priceText: `¥ ${Number(product.offers.price).toLocaleString('ja-JP')}`, priceNumber: Number(product.offers.price) }
+            : null)
+      || fromBody;
 
+    // ---- 説明（取れる範囲で）
     const description =
-      (typeof product?.description === 'string' && product.description.trim())
-      || (ogDesc ? ogDesc.trim() : '')
-      || bodyDesc
-      || '';
+      (typeof product?.description === 'string' ? product.description : '') ||
+      pickFirstMeta(html, [['name','description'], ['property','og:description']]) ||
+      '';
 
-    if (price) {
+    // ---- 品質ゲート（直取りが変なら Playwright へ委譲）
+    const sane =
+      (title && title.replace(/\s+/g, '').length >= 5) &&
+      (price && price.priceNumber && price.priceNumber >= 500);
+
+    if (sane) {
       return {
         ok: true,
         via: 'direct',
         data: {
-          title: title,
-          brand: brand,
+          title,
+          brand,
           price: price.priceText,
           priceNumber: price.priceNumber,
           currency: 'JPY',
@@ -152,20 +157,18 @@ async function directFetchMercari(url) {
         raw: { source: product ? 'ld+json' : (priceFromMeta ? 'meta' : 'body') }
       };
     }
+
     return { ok: false, reason: 'direct_incomplete' };
   } finally {
     clearTimeout(id);
   }
 }
 
-// ---------- Playwright（起動短縮＋ブロック強化） ----------
+// ---------- Playwright（起動短縮＋不要リソース遮断） ----------
 let browserPromise = null;
 async function getBrowser() {
   if (browserPromise) {
-    try {
-      const b = await browserPromise;
-      if (!('isConnected' in b) || b.isConnected()) return b;
-    } catch {}
+    try { const b = await browserPromise; if (!('isConnected' in b) || b.isConnected()) return b; } catch {}
   }
   browserPromise = chromium.launch({
     headless: HEADLESS,
@@ -199,49 +202,41 @@ async function scrapeWithPlaywright(url) {
   try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }); }
   catch { await page.goto(url, { waitUntil: 'commit', timeout: Math.min(15000, NAV_TIMEOUT_MS) }).catch(() => {}); }
 
+  // 価格は本文に現れるので軽く待つ
   await page.waitForFunction(() => /¥\s*[0-9,.]+/.test(document.body?.innerText || ''), { timeout: 5000 }).catch(() => {});
 
+  // DOM 抽出
   const domData = await page.evaluate(() => {
-    const get = sel => document.querySelector(sel)?.textContent?.trim() || '';
+    const getText = sel => document.querySelector(sel)?.textContent?.trim() || '';
     const meta = p => document.querySelector(`meta[property="${p}"]`)?.content || '';
 
     const title =
-      get('h1, h1[aria-label], [data-testid="item-title"], [class*="ItemHeader_title"]') ||
-      meta('og:title') || document.title || '';
+      getText('h1, h1[aria-label], [data-testid="item-title"], [class*="ItemHeader_title"]') ||
+      meta('og:title') ||
+      document.title ||
+      '';
 
-    const body = (document.body?.innerText || '').replace(/\s+\n/g,'\n').replace(/\n{3,}/g,'\n\n');
+    // 価格（本文→専用要素）
+    const body = (document.body?.innerText || '').replace(/\s+/g,' ');
     const m = body.match(/¥\s*[0-9,.]+/);
-    const price = m ? m[0] : (get('[data-testid="item-price"]') || get('[class*="Price_price"], [class*="ItemPrice_price"]'));
+    const priceGuess = m ? m[0] : '';
 
-    // 説明抽出
-    const ogDesc = meta('og:description') || (document.querySelector('meta[name="description"]')?.content || '');
+    const priceNode =
+      getText('[data-testid="item-price"]') ||
+      getText('[class*="Price_price"], [class*="ItemPrice_price"]') ||
+      '';
 
-    const byHeading = (() => {
-      const heading = Array.from(document.querySelectorAll('h1,h2,h3,div,strong,span'))
-        .find(n => /商品の説明/.test(n.textContent || ''));
-      if (!heading) return '';
-      let cur = heading.nextElementSibling;
-      const parts = [];
-      for (let i=0; i<12 && cur; i++, cur = cur.nextElementSibling) {
-        const t = (cur.innerText || '').trim();
-        if (!t) continue;
-        if (/^\s*(商品の情報|カテゴリ|カテゴリー|ブランド|サイズ|色|配送|配送料|発送|コメント|購入|出品者)\b/.test(t)) break;
-        parts.push(t);
-        if (parts.join('\n').length > 1200) break;
-      }
-      return parts.join('\n').trim();
-    })();
+    // 説明
+    const desc =
+      getText('[data-testid="item-description"]') ||
+      getText('[data-testid="description"]') ||
+      getText('[class*="Description"], [class*="item-description"], section[data-testid="description"]') ||
+      meta('og:description') || '';
 
-    const bodyBlock = (() => {
-      const mt = body.match(/商品の説明\s*([\s\S]{10,2000}?)(?:\n\s*(?:商品の情報|カテゴリ|カテゴリー|ブランド|サイズ|色|配送|配送料|発送|コメント|購入|出品者)\b|$)/);
-      return mt ? mt[1].trim() : '';
-    })();
-
-    const description = byHeading || bodyBlock || ogDesc || '';
-    return { title, price, description };
+    return { title, price: priceNode || priceGuess, description: desc };
   });
 
-  // JSON-LD(Product) から補完
+  // JSON-LD
   const ld = await page.$$eval('script[type="application/ld+json"]', ns => ns.map(n => n.textContent || ''));
   let fromLd = null;
   for (const block of ld) {
@@ -267,17 +262,20 @@ async function scrapeWithPlaywright(url) {
   const brand = typeof fromLd?.brand === 'string' ? fromLd?.brand : (fromLd?.brand?.name || '');
   const offers = Array.isArray(fromLd?.offers) ? fromLd.offers[0] : fromLd?.offers;
   const currency = offers?.priceCurrency || 'JPY';
+
   let priceNumber = offers?.price ? Number(String(offers.price).replace(/[^0-9.]/g, '')) : undefined;
   if (!priceNumber && domData.price) {
     const mm = domData.price.match(/([0-9,.]+)/);
     if (mm) priceNumber = Number(mm[1].replace(/,/g, ''));
   }
+
+  // 価格表示は priceNumber を最優先（誤検出対策）
   const priceText = (priceNumber ? `¥ ${priceNumber.toLocaleString('ja-JP')}` : (domData.price || ''));
+
   const title = fromLd?.name || fromLd?.title || domData.title || '';
   const description =
-    (typeof fromLd?.description === 'string' && fromLd.description.trim())
-      ? fromLd.description.trim()
-      : (domData.description || '');
+    (typeof fromLd?.description === 'string' ? fromLd.description : '') ||
+    domData.description || '';
 
   const html = await page.content();
   await writeDebugHTML(html, 'mercari');
@@ -287,7 +285,7 @@ async function scrapeWithPlaywright(url) {
   return {
     ok: true,
     via: 'playwright',
-    data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description }
+    data: { title: title || '', brand, price: priceText || '', priceNumber, currency, description: description || '' }
   };
 }
 
@@ -304,16 +302,33 @@ app.post('/scrape', requireApiKey, async (req, res) => {
   if (!/^https?:\/\//i.test(url)) return res.status(400).json({ ok: false, error: 'url must be http/https' });
 
   try {
+    // 直取りのみモード
     if (DIRECT_ONLY_ENV || directOnly === true) {
       const r0 = await directFetchMercari(url);
       return r0.ok ? res.json({ ok: true, url, type, ...r0 }) : res.status(503).json({ ok: false, error: 'direct_only_miss' });
     }
-    if (DIRECT_FIRST && quick !== false) {
-      const r = await directFetchMercari(url);
-      if (r.ok) return res.json({ ok: true, url, type, ...r });
+
+   // 直取り → 品質チェック → OKなら返す / NGならフォールバック
+if (DIRECT_FIRST && quick !== false) {
+  const r = await directFetchMercari(url);
+  if (r?.ok) {
+    const d = r.data || {};
+    const badTitle = !d.title || d.title === 'メルカリ';
+    const badPrice = !d.priceNumber || d.priceNumber < 1000; // 送料/手数料等のノイズ対策
+    const looksBad = badTitle || badPrice || r?.raw?.source === 'body';
+
+    if (!looksBad) {
+      return res.json({ ok: true, url, type, ...r });
     }
+    // ここを通ると Playwright にフォールバック
+  }
+}
+
+
+    // Playwright
     const r2 = await scrapeWithPlaywright(url);
     if (r2.ok) return res.json({ ok: true, url, type, ...r2 });
+
     return res.status(500).json({ ok: false, error: r2.reason || 'unknown_error' });
   } catch (e) {
     const msg = e?.message || String(e);
@@ -323,15 +338,11 @@ app.post('/scrape', requireApiKey, async (req, res) => {
 
 app.get('/', (_req, res) => res.json({ ok: true, service: 'mercari-scraper', ts: nowISO() }));
 
-// ---------- 終了処理 ----------
-async function shutdown() {
-  try { const b = await browserPromise; await b?.close(); } catch {}
-  process.exit(0);
-}
+// ---------- シャットダウン ----------
+async function shutdown() { try { const b = await browserPromise; await b?.close(); } catch {} process.exit(0); }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// ---------- 起動 ----------
 app.listen(PORT, () => {
   console.log(`[mercari-scraper] listening on :${PORT} HEADLESS=${HEADLESS} DIRECT_FIRST=${DIRECT_FIRST}`);
 });
